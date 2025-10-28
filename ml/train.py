@@ -1,4 +1,8 @@
 # ml/train.py
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import os
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
