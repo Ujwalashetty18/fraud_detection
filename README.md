@@ -71,21 +71,22 @@ These results indicate a strong ability to identify fraudulent transactions with
 
 ## 🔹 Demo Instructions  
 
-### 🧠 Train Model  
+### Commands used to run project  
 ```bash
+🧠 Train Model
 python -m ml.train
 📈 Evaluate Model
 python -m ml.evaluate
 ⚙️ Start Flask API
 python api/app.py
 API Endpoints:
-
+http://127.0.0.1:5000/health
 /health – API status check
 
 /predict – Accepts a single JSON transaction
 
 /predict_csv – Accepts CSV file and returns fraud probabilities
-
+##Open another terminal
 💻 Start React Frontend
 cd frontend
 npm install
@@ -96,8 +97,8 @@ Enter transaction fields or upload a CSV file for batch prediction.
 streamlit run streamlit_app.py
 Visit http://localhost:8501
 Upload CSV or input fields interactively to view results.
-🔹 Limitations & Future Work
 
+🔹 Limitations & Future Work
 The dataset is anonymized, so feature meanings are unknown (limits explainability).
 
 No user or card-level identifiers — cannot model behavioral patterns.
@@ -139,3 +140,6 @@ Visualization: matplotlib, seaborn
 Environment: VS Code
 
 Dataset: Kaggle (Credit Card Fraud Detection, 2013)
+Download the dataset (creditcard.csv) from Kaggle:
+https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+and place it in the `data/` folder.
