@@ -1,5 +1,6 @@
 # api/app.py
-import sys, os
+import sys
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -9,7 +10,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import joblib
 import pandas as pd
-import os
 import traceback
 from ml.utils import transform_amount_with_scaler, parse_iso_timestamp, ensure_latlon, load_scaler, prepare_for_prediction
 from datetime import datetime
@@ -54,24 +54,27 @@ except Exception as e:
     scaler = None
 
 # Required ML columns
-REQUIRED = set(['Time','Amount'] + [f'V{i}' for i in range(1,29)])
+REQUIRED = set(['Time', 'Amount'] + [f'V{i}' for i in range(1, 29)])
 
 # -----------------------
-# MongoDB setup
+# MongoDB setup (last_txns + history_txns)
 # -----------------------
 MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017/')
 MONGO_DB = os.getenv('MONGO_DB', 'fraudDB')
-MONGO_COLLECTION = os.getenv('MONGO_COLLECTION', 'last_txns')
+MONGO_COLLECTION = os.getenv('MONGO_COLLECTION', 'last_txns')    # per-card last txn (upsert)
+HISTORY_COLLECTION = os.getenv('HISTORY_COLLECTION', 'history_txns')  # full history
 
 try:
     mongo_client = MongoClient(MONGO_URI)
     mongo_db = mongo_client[MONGO_DB]
     last_txns = mongo_db[MONGO_COLLECTION]
-    print(f"Connected to MongoDB: {MONGO_URI} DB:{MONGO_DB} COL:{MONGO_COLLECTION}")
+    history_col = mongo_db[HISTORY_COLLECTION]
+    print(f"Connected to MongoDB: {MONGO_URI} DB:{MONGO_DB} COL:{MONGO_COLLECTION} HISTORY:{HISTORY_COLLECTION}")
 except Exception as e:
     print("Warning: Could not connect to MongoDB:", e)
     mongo_client = None
     last_txns = None
+    history_col = None
 
 # -----------------------
 # Email helper (optional)
@@ -82,7 +85,7 @@ def send_alert_email(subject: str, body: str):
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_PASS")
     alert_from = os.getenv("ALERT_FROM")
-    alert_to = os.getenv("ALERT_TO")
+    alert_to = os.getenv("ALERT_TO")  # comma separated allowed
 
     if not (smtp_host and smtp_user and smtp_pass and alert_from and alert_to):
         print("Email creds/recipients not fully set; skipping email.")
@@ -192,9 +195,9 @@ def predict():
         if missing:
             return jsonify({'error': f'Missing ML columns: {sorted(list(missing))}'}), 400
 
-        # Prepare features for model predict
+        # Prepare features for model predict (uses Amount scaling inside)
         df_for_model = prepare_for_prediction(df_ml, scaler)  # uses Amount -> Amount_scaled
-        probs = model.predict_proba(df_for_model)[:,1]
+        probs = model.predict_proba(df_for_model)[:, 1]
         df_ml['fraud_probability'] = probs
 
         results = []
@@ -203,18 +206,16 @@ def predict():
             rec['location_flag'] = False
             rec['location_message'] = None
 
-            # Resolve lat/lon pair for current row
+            # Resolve lat/lon pair for current row and timestamp
             cur_latlon = ensure_latlon(row)
             cur_ts = row.get('Timestamp') or row.get('timestamp') or None
-            # parse timestamp to datetime if present
             cur_ts_parsed = None
             try:
                 cur_ts_parsed = parse_iso_timestamp(cur_ts) if cur_ts else None
             except Exception as e:
-                # invalid timestamp format
                 rec['location_message'] = f"Invalid Timestamp format: {e}"
 
-            # If 'prev' explicitly provided, prefer that
+            # Location-based travel check: prefer explicit 'prev' provided
             if isinstance(row, dict) and row.get('prev'):
                 prev = row.get('prev')
                 prev_latlon = ensure_latlon(prev)
@@ -227,7 +228,7 @@ def predict():
                 except Exception as e:
                     rec['location_message'] = f"Location check error: {e}"
             else:
-                # Try to get prev from the list (previous entry in provided array)
+                # Try previous row in the provided list
                 if i > 0:
                     prev = rows[i-1]
                     prev_latlon = ensure_latlon(prev)
@@ -239,7 +240,7 @@ def predict():
                         rec['location_message'] = msg
                     except Exception as e:
                         rec['location_message'] = f"Location check error: {e}"
-                # If not in-list prev, try Mongo last_txn for same card_id
+                # Otherwise try last txn from DB (per-card)
                 elif isinstance(row, dict) and row.get('card_id'):
                     card_id = row.get('card_id')
                     prev_doc = get_last_txn_for_card(card_id)
@@ -253,29 +254,42 @@ def predict():
                         except Exception as e:
                             rec['location_message'] = f"Last txn location check error: {e}"
 
-            # After checks, persist current txn as last for the card_id (if provided)
-            if isinstance(row, dict) and row.get('card_id'):
-                card_id = row.get('card_id')
-                store_doc = {
-                    "card_id": card_id,
-                    "Timestamp": row.get('Timestamp') or row.get('timestamp'),
-                    "lat": row.get('lat'),
-                    "lon": row.get('lon'),
-                    "Location": row.get('Location') or row.get('location'),
-                    "ml_prob": rec.get('fraud_probability'),
+            # Persist current txn:
+            # 1) insert into full history collection (for charts)
+            # 2) upsert last_txn for quick last lookup per card
+            try:
+                # build history document
+                history_doc = {
+                    "card_id": row.get('card_id') if isinstance(row, dict) else None,
+                    "Time": row.get('Time') if isinstance(row, dict) else None,
+                    "Amount": row.get('Amount') if isinstance(row, dict) else None,
+                    "features": {k: row.get(k) for k in row.keys()} if isinstance(row, dict) else {},
+                    "fraud_probability": float(rec.get('fraud_probability', 0)),
+                    "location_flag": rec.get('location_flag', False),
+                    "location_message": rec.get('location_message'),
                     "stored_at": datetime.utcnow()
                 }
-                try:
+                if history_col is not None:
+                    history_col.insert_one(history_doc)
+                # upsert the per-card last_txn document
+                if isinstance(row, dict) and row.get('card_id') and last_txns is not None:
+                    card_id = row.get('card_id')
+                    store_doc = {
+                        "card_id": card_id,
+                        "Timestamp": row.get('Timestamp') or row.get('timestamp'),
+                        "lat": row.get('lat'),
+                        "lon": row.get('lon'),
+                        "Location": row.get('Location') or row.get('location'),
+                        "ml_prob": rec.get('fraud_probability'),
+                        "stored_at": datetime.utcnow()
+                    }
                     upsert_last_txn(card_id, store_doc)
-                except Exception as e:
-                    print("Warning: could not upsert last txn:", e)
+            except Exception as e:
+                print("Warning: could not persist history/upsert last_txn:", e)
 
             results.append(rec)
 
         # Notification handling (if notify true in single payload or first list item)
-                # --- Automatic notification handling (auto-send when suspicious) ---
-        from datetime import timedelta
-
         FRAUD_THRESH = float(os.getenv('FRAUD_PROB_THRESHOLD', 0.8))
         ALERT_COOLDOWN_MINUTES = int(os.getenv('ALERT_COOLDOWN_MINUTES', 60))
 
@@ -289,6 +303,7 @@ def predict():
             if not last_alert:
                 return True
             # last_alert may be string or datetime
+            last_alert_dt = None
             if isinstance(last_alert, str):
                 try:
                     last_alert_dt = parse_iso_timestamp(last_alert)
@@ -320,7 +335,7 @@ def predict():
                 else:
                     r['_alert_skipped'] = True
             else:
-                # no card_id -> include in alerts by default (but this may spam)
+                # no card_id -> include in alerts by default
                 alerts_to_send.append(r)
 
         if alerts_to_send:
@@ -342,8 +357,6 @@ def predict():
         # otherwise just return results
         return jsonify(results)
 
-
-        return jsonify(results)
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -366,6 +379,29 @@ def predict_csv():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=True)
+@app.route("/history", methods=["GET"])
+def get_history():
+    card_id = request.args.get("card_id")
+    if not card_id:
+        return jsonify({"error": "card_id is required"}), 400
 
+    if history_col is None:
+        return jsonify({"error": "History DB not available"}), 500
+
+    # fetch last 50 transactions for this card (sorted newest first)
+    rows = list(history_col.find({"card_id": card_id}).sort("stored_at", -1).limit(50))
+
+    # convert Mongo ObjectId and timestamps to JSON-friendly types
+    for r in rows:
+        r["_id"] = str(r["_id"])
+        if "stored_at" in r and isinstance(r["stored_at"], datetime):
+            r["stored_at"] = r["stored_at"].isoformat()
+
+    return jsonify(rows), 200
+
+if __name__ == "__main__":
+    # Ensure model exists
+    if model is None:
+        print("ERROR: Model not loaded. Exiting.")
+        exit(1)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)), debug=True)
